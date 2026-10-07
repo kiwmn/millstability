@@ -115,6 +115,13 @@ print(ei.shape)       # torch.Size([1])
 
 `src/` 包含 Python 绑定、矩阵构造和 EI 求解；`include/millstability/` 包含头文件；`examples/basic_usage.py` 演示两个主要接口。根目录的 `setup.py`、`pyproject.toml` 和 `MANIFEST.in` 分别负责 CUDA 编译、构建依赖和源码打包。
 
+## 参考文献
+
+当前实现采用文献 1 的线性插值全离散公式，包括式 (11)、(12)、(16)–(18) 及状态转移矩阵构造。文献 2 介绍了采用 Hermite 插值的相关改进方法。
+
+1. Ding, Y., Zhu, L. M., Zhang, X. J., & Ding, H. (2010). A full-discretization method for prediction of milling stability. *International Journal of Machine Tools and Manufacture*, **50**(5), 502–509. [DOI: 10.1016/j.ijmachtools.2010.01.003](https://doi.org/10.1016/j.ijmachtools.2010.01.003).
+2. Liu, Y., Zhang, D., & Wu, B. (2012). An efficient full-discretization method for prediction of milling stability. *International Journal of Machine Tools and Manufacture*, **63**, 44–48. [DOI: 10.1016/j.ijmachtools.2012.07.008](https://doi.org/10.1016/j.ijmachtools.2012.07.008).
+
 ## 许可证
 
 [MIT](LICENSE)
