@@ -16,6 +16,7 @@ setup(
     license="MIT",
     python_requires=">=3.10",
     install_requires=["torch>=2.8"],
+    extras_require={"examples": ["matplotlib>=3.7"]},
     packages=[],
     ext_modules=[
         CUDAExtension(
