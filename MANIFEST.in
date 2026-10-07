@@ -1,0 +1,4 @@
+include README.md LICENSE
+recursive-include include *.h *.cuh
+recursive-include src *.cpp *.cu
+recursive-include examples *.py
