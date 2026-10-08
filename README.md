@@ -40,7 +40,16 @@ python examples/basic_usage.py
 
 ### 论文中的两个 2DOF 案例
 
-[examples/basic_usage.py](examples/basic_usage.py) 绘制 2010 年论文表 2 的两个逆铣案例：`a/D=0.1` 和 `0.05`，`m=40`，转速与切深分别划分为 400、200 个区间。程序计算 `EI=1` 等值线，保存为 `examples/two_dof_stability.png`。完整计算需要一定时间。
+[examples/basic_usage.py](examples/basic_usage.py) 绘制 2010 年论文表 2 的两个逆铣案例：`a/D=0.1` 和 `0.05`，`m=40`，转速与切深分别划分为 400、200 个区间。程序计算 `EI=1` 等值线，保存为 `examples/two_dof_stability.png`，并打印每个案例的计算耗时。
+
+每个案例包含 80,601 个工艺点。单张 RTX 3090、Intel Xeon Platinum 8373C、PyTorch 2.8.0+cu128 下，按示例顺序各运行一次的实测结果：
+
+| 案例 | 计算耗时（秒） |
+| --- | ---: |
+| `a/D=0.1` | 177.70 |
+| `a/D=0.05` | 167.96 |
+
+计时在调用前后同步 CUDA，包含矩阵构造、特征值求解和 EI 计算，不包含绘图与图片保存。
 
 ![两个 2DOF 案例的稳定性边界](examples/two_dof_stability.png)
 

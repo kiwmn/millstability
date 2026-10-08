@@ -2,6 +2,7 @@
 
 import math
 from pathlib import Path
+from time import perf_counter
 
 import matplotlib
 matplotlib.use("Agg")
@@ -28,7 +29,13 @@ def main():
 
     for ax, immersion in zip(axes, (0.1, 0.05)):
         print(f"Computing 2DOF case a/D={immersion:g}...", flush=True)
+        # Synchronize both ends to measure the complete CPU/GPU computation.
+        torch.cuda.synchronize(physics["device_id"])
+        started = perf_counter()
         ei = millstability.milling_stability_ei_cuda(**physics, **grid, aD=immersion)
+        torch.cuda.synchronize(physics["device_id"])
+        elapsed = perf_counter() - started
+        print(f"a/D={immersion:g}: {elapsed:.2f} s ({ei.numel():,} points)", flush=True)
         # EI axes are [speed, depth]; contour expects [vertical axis, horizontal axis].
         ax.contour(speeds, depths, ei.cpu().numpy().T, levels=[1.0], colors="black", linewidths=1.0)
         ax.set_title(rf"$a/D = {immersion:g}$")
