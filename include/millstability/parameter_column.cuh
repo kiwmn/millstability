@@ -4,8 +4,8 @@
 namespace millstability::detail {
 inline constexpr int kParameterGeometryMaxTeeth = 64;
 
-// Requires 2 <= m <= 40. For N <= 64, workspace holds (m + 1) * N * 4 floats;
-// for larger N, pass nullptr and compute geometry within each block.
+// Shared-memory construction for 2 <= m <= 62.
+// Geometry workspace: [m+1, N, 4] when N <= kParameterGeometryMaxTeeth.
 void launch_parameter_columns(
     float* result, float* geometry_workspace,
     const float* parameters, int N, float aD, int up_or_down,

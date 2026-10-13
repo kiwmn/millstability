@@ -4,7 +4,7 @@
 namespace millstability {
 namespace detail {
 
-// Matrix recurrence for m = 1: each block owns a speed, each thread a depth.
+// m=1: one block per spindle speed and one thread per cutting depth.
 __global__ void stability_analysis_kernel(
     float* result_ptr, float* d_A0, float* d_invA0,
     float* d_hxx, float* d_hxy, float* d_hyx, float* d_hyy,
@@ -22,10 +22,10 @@ __global__ void stability_analysis_kernel(
 
     if (x <= stx && y <= sty) {
         float o = o_st + (float)x * (o_fi - o_st) / stx;
-        // One tooth-passing period in seconds; dt is one of its m time steps.
         float tau = 60.0f / o / N;
         float dt = tau / m;
 
+        // Thread 0 prepares the shared integration matrices and cutting coefficients.
         if (y  == 0) {
 
             float A0_dt[16];
@@ -35,6 +35,8 @@ __global__ void stability_analysis_kernel(
 
             matrix_expm_4x4(A0_dt, 1.0f, s_Fi0);
 
+            // Phi1=A0^-1*(Phi0-I), Phi2=A0^-1*(Phi0*dt-Phi1),
+            // Phi3=A0^-1*(Phi0*dt^2-2*Phi2).
             float Fi0_minus_I[16];
             for (int i = 0; i < 16; i++) {
                 Fi0_minus_I[i] = s_Fi0[i] - (i % 5 == 0 ? 1.0f : 0.0f);
@@ -99,10 +101,10 @@ __global__ void stability_analysis_kernel(
 
         int matrix_size = 2*m + 4;
 
-        float D[84][84] = {0};
-        float Fi[84][84] = {0};
+        float D[8][8] = {0};
+        float Fi[8][8] = {0};
 
-        float d[82];
+        float d[4];
         for(int idx = 0; idx < 2*m+2; idx++) {
             d[idx] = 1.0f;
         }
@@ -114,23 +116,22 @@ __global__ void stability_analysis_kernel(
         for(int idx = 0; idx < 2*m+2; idx++) {
             int row = idx + 2;
             int col = idx;
-            if(row < 84 && col < 84) {
+            if(row < matrix_size && col < matrix_size) {
                 D[row][col] = d[idx];
             }
         }
 
-        // The remaining matrix rows shift the two displacement histories.
         D[4][0] = 1.0f;
 
         D[5][1] = 1.0f;
 
-        for(int idx = 0; idx < 84; idx++) {
+        for(int idx = 0; idx < matrix_size; idx++) {
             Fi[idx][idx] = 1.0f;
         }
 
         for (int i = 0; i < m; i++) {
 
-            // A0k holds the next sample of cutting coefficients, multiplied by -depth.
+            // Cutting terms occupy rows 2..3 and displacement columns 0..1.
             float A0k[16] = {0};
             if (i < m) {
                 A0k[2*4 + 0] = -w * d_hxx_shared[i + 1];
@@ -139,7 +140,6 @@ __global__ void stability_analysis_kernel(
                 A0k[3*4 + 1] = -w * d_hyy_shared[i + 1];
             }
 
-            // A1k is depth times the coefficient difference divided by dt.
             float A1k[16] = {0};
             if (i < m) {
                 A1k[2*4 + 0] = w * (d_hxx_shared[i + 1] - d_hxx_shared[i]) / dt;
@@ -148,7 +148,7 @@ __global__ void stability_analysis_kernel(
                 A1k[3*4 + 1] = w * (d_hyy_shared[i + 1] - d_hyy_shared[i]) / dt;
             }
 
-            // F01 = (Fi2*A0k + Fi3*A1k) / dt.
+            // F01=(Phi2*A0k+Phi3*A1k)/dt (Ding et al., 2010, Eq. 11).
             float F01[16] = {0};
 
             float temp1[16] = {0};
@@ -175,7 +175,7 @@ __global__ void stability_analysis_kernel(
                 F01[idx] = temp1[idx] + temp2[idx];
             }
 
-            // Fkp1 = (Fi1 - Fi2/dt)*A0k + (Fi2 - Fi3/dt)*A1k.
+            // Fkp1=(Phi1-Phi2/dt)*A0k+(Phi2-Phi3/dt)*A1k (Eq. 12).
             float Fkp1[16] = {0};
 
             float temp3[16] = {0};
@@ -215,7 +215,6 @@ __global__ void stability_analysis_kernel(
                 }
             }
 
-            // The step update uses inverse(I - Fkp1).
             float invOfImFkp1[16];
             matrix_inverse_4x4(I_minus_Fkp1, invOfImFkp1);
 
@@ -263,12 +262,12 @@ __global__ void stability_analysis_kernel(
                 }
             }
 
-            float new_Fi[84][84] = {0};
+            // m=1 overlaps current and delay columns; sum the full step matrix.
+            float new_Fi[8][8] = {0};
 
             for (int row = 0; row < 4; ++row) {
                 for (int col = 0; col < matrix_size; ++col) {
                     float value = 0.0f;
-                    // Overlapping current-state and delay columns require the full row sum.
                     if (m == 1) {
                         for (int k = 0; k < matrix_size; ++k) {
                             value += D[row][k] * Fi[k][col];
@@ -299,9 +298,7 @@ __global__ void stability_analysis_kernel(
                     Fi[row][col] = new_Fi[row][col];
                 }
             }
-
         }
-
         if(x <= stx && y <= sty){
 
             int result_idx = x * (sty + 1) + y;
@@ -315,7 +312,7 @@ __global__ void stability_analysis_kernel(
     }
 }
 
-// Sum the engaged teeth at each sample; these coefficients serve the whole grid.
+// One thread per angular sample; both engagement endpoints are included.
 __global__ void compute_cutting_coefficients_kernel(
     float* hxx, float* hxy, float* hyx, float* hyy,
     float fist, float fiex, float Kt, float Kn,

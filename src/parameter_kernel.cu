@@ -4,7 +4,7 @@
 namespace millstability {
 namespace detail {
 
-// Matrix recurrence for m = 1, with one thread per physical parameter row.
+// m=1: one thread constructs a matrix for one physical parameter row.
 __global__ void multi_parameter_single_point_kernel(
     float* result_ptr, float* parameters,
     int N, float aD, int up_or_down, int m,
@@ -13,6 +13,7 @@ __global__ void multi_parameter_single_point_kernel(
     int param_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (param_idx >= n_params) return;
 
+    // Parameter columns: Kt, Kn, w0x, w0y, zetax, zetay, m_tx, m_ty.
     int param_offset = param_idx * 8;
     float Kt = parameters[param_offset + 0];
     float Kn = parameters[param_offset + 1];
@@ -95,7 +96,8 @@ __global__ void multi_parameter_single_point_kernel(
     }
 
     float dtr = 2.0f * M_PI / N / m;
-    float hxx[101], hxy[101], hyx[101], hyy[101];
+
+    float hxx[2], hxy[2], hyx[2], hyy[2];
 
     for (int i = 0; i <= m; i++) {
         float hxx_sum = 0.0f, hxy_sum = 0.0f, hyx_sum = 0.0f, hyy_sum = 0.0f;
@@ -131,6 +133,8 @@ __global__ void multi_parameter_single_point_kernel(
 
     float s_Fi1[16] = {0}, s_Fi2[16] = {0}, s_Fi3[16] = {0};
 
+    // Phi1=A0^-1*(Phi0-I), Phi2=A0^-1*(Phi0*dt-Phi1),
+    // Phi3=A0^-1*(Phi0*dt^2-2*Phi2).
     float Fi0_minus_I[16];
     for (int i = 0; i < 16; i++) {
         Fi0_minus_I[i] = s_Fi0[i] - (i % 5 == 0 ? 1.0f : 0.0f);
@@ -174,11 +178,11 @@ __global__ void multi_parameter_single_point_kernel(
     }
 
     int matrix_size = 2*m + 4;
-    float Fi[84][84] = {0};
-    float D[84][84] = {0};
+    float Fi[8][8] = {0};
+    float D[8][8] = {0};
 
-    float d[82];
-    for(int idx = 0; idx < 82; idx++) {
+    float d[4];
+    for(int idx = 0; idx < 4; idx++) {
         d[idx] = 1.0f;
     }
 
@@ -186,7 +190,7 @@ __global__ void multi_parameter_single_point_kernel(
         d[idx] = 0.0f;
     }
 
-    for(int idx = 0; idx < 82; idx++) {
+    for(int idx = 0; idx < 2 * m + 2; idx++) {
         int row = idx + 2;
         int col = idx;
         if(row < matrix_size && col < matrix_size) {
@@ -203,7 +207,7 @@ __global__ void multi_parameter_single_point_kernel(
 
     for (int i = 0; i < m; i++) {
 
-        // A0k holds the next sample of cutting coefficients, multiplied by -depth.
+        // Cutting terms occupy rows 2..3 and displacement columns 0..1.
         float A0k[16] = {0};
         if (i < m) {
             A0k[2*4 + 0] = -w * hxx[i + 1];
@@ -212,7 +216,6 @@ __global__ void multi_parameter_single_point_kernel(
             A0k[3*4 + 1] = -w * hyy[i + 1];
         }
 
-        // A1k is depth times the coefficient difference divided by dt.
         float A1k[16] = {0};
         if (i < m) {
             A1k[2*4 + 0] = w * (hxx[i + 1] - hxx[i]) / dt;
@@ -221,7 +224,7 @@ __global__ void multi_parameter_single_point_kernel(
             A1k[3*4 + 1] = w * (hyy[i + 1] - hyy[i]) / dt;
         }
 
-        // F01 = (Fi2*A0k + Fi3*A1k) / dt.
+        // F01=(Phi2*A0k+Phi3*A1k)/dt (Ding et al., 2010, Eq. 11).
         float F01[16] = {0};
 
         float temp1[16] = {0};
@@ -248,7 +251,7 @@ __global__ void multi_parameter_single_point_kernel(
             F01[idx] = temp1[idx] + temp2[idx];
         }
 
-        // Fkp1 = (Fi1 - Fi2/dt)*A0k + (Fi2 - Fi3/dt)*A1k.
+        // Fkp1=(Phi1-Phi2/dt)*A0k+(Phi2-Phi3/dt)*A1k (Eq. 12).
         float Fkp1[16] = {0};
 
         float temp3[16] = {0};
@@ -287,7 +290,6 @@ __global__ void multi_parameter_single_point_kernel(
             }
         }
 
-        // The step update uses inverse(I - Fkp1).
         float invOfImFkp1[16];
         matrix_inverse_4x4(I_minus_Fkp1, invOfImFkp1);
 
@@ -297,6 +299,7 @@ __global__ void multi_parameter_single_point_kernel(
             }
         }
 
+        // Current and delay columns overlap at m=1; preserve the step assignments.
         float Fi0_plus_F01[16];
         for(int idx = 0; idx < 16; idx++) {
             Fi0_plus_F01[idx] = s_Fi0[idx] + F01[idx];
@@ -338,7 +341,7 @@ __global__ void multi_parameter_single_point_kernel(
             }
         }
 
-        float new_Fi[84][84] = {0};
+        float new_Fi[8][8] = {0};
 
         for(int row = 0; row < matrix_size; row++) {
             for(int col = 0; col < matrix_size; col++) {

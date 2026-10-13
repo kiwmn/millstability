@@ -11,14 +11,14 @@ at::Tensor milling_stability_ei_cuda(
     float m_tx, float m_ty, float aD, int up_or_down, int stx, int sty,
     float w_st, float w_fi, float o_st, float o_fi, int m, int device_id) {
 
-    return detail::spectral_radius(detail::grid_matrices(
+    return detail::spectral_radius(detail::grid_reduced_matrices(
         N, Kt, Kn, w0x, w0y, zetax, zetay, m_tx, m_ty, aD, up_or_down,
         stx, sty, w_st, w_fi, o_st, o_fi, m, device_id));
 }
 
 at::Tensor test_ei(int device_id) {
 
-    // Reference process: two teeth, 5,000-25,000 rpm and 0-10 mm axial depth.
+    // Two teeth, 5,000-25,000 rpm and 0-10 mm axial depth.
     const float frequency = 922.0f * 2.0f * M_PI;
     return milling_stability_ei_cuda(
         2, 6e8f, 2e8f, frequency, frequency, 0.011f, 0.011f,

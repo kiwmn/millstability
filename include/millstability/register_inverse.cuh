@@ -3,7 +3,7 @@
 
 namespace millstability::detail {
 
-// Unroll the 4 x 8 augmented matrix so pivoted elimination can use registers.
+// Unroll the 4x8 augmented matrix so pivoted elimination uses registers.
 __device__ __forceinline__ void inverse_register_4x4(const float* A, float* result) {
     float aug[4][8];
     #pragma unroll

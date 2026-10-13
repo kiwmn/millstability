@@ -1,4 +1,5 @@
 from pathlib import Path
+import sys
 
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
@@ -24,13 +25,13 @@ setup(
             sources=[
                 str(Path("src") / source)
                 for source in (
-                    "bindings.cpp", "ei.cpp", "eigensolver.cpp", "ei_reduction.cu",
-                    "matrices.cu", "grid_kernel.cu", "column_kernel.cu",
+                    "bindings.cpp", "ei.cpp", "eigensolver.cpp",
+                    "matrices.cu", "grid_kernel.cu", "column_kernel.cu", "global_column_kernel.cu",
                     "parameter_kernel.cu", "parameter_column.cu",
                 )
             ],
             include_dirs=[str(ROOT / "include")],
-            libraries=["cudart", "cublas", "cusolver"],
+            libraries=["cudart", "cublas"] + (["dl"] if sys.platform.startswith("linux") else []),
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
                 "nvcc": [

@@ -6,7 +6,7 @@
 namespace millstability {
 namespace detail {
 
-// Gauss-Jordan inverse with partial pivoting; matrices use row-major storage.
+// Row-major Gauss-Jordan inverse with partial pivoting.
 __device__ inline void matrix_inverse_4x4(const float* A, float* result) {
 
     float aug[32];
@@ -60,8 +60,7 @@ __device__ inline void matrix_inverse_4x4(const float* A, float* result) {
     }
 }
 
-// Taylor approximation through order 10, stopping when the term norm is below 1e-10.
-// A must already include the time-step factor; dt is unused.
+// Approximate exp(A) through A^10/10!; A already contains the time step.
 __device__ inline void matrix_expm_4x4(const float* A, float dt, float* result) {
     const int n = 4;
 

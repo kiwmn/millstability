@@ -4,7 +4,8 @@
 
 namespace millstability::detail {
 
-// Return CUDA float32 radii of [..., n, n] matrices without modifying them.
+// CUDA FP32 [...,n,n] -> CUDA FP32 [...] spectral radii.
+// Trim exact zero columns and solve in FP64 with hardware-selected host concurrency.
 at::Tensor spectral_radius(const at::Tensor& matrices);
 
 }

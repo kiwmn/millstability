@@ -2,6 +2,7 @@
 #include "millstability/matrix_kernels.cuh"
 #include "millstability/column_kernel.cuh"
 #include "millstability/parameter_column.cuh"
+#include "millstability/global_column_kernel.cuh"
 #include "millstability/validation.h"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -12,7 +13,6 @@
 namespace millstability::detail {
 namespace {
 
-// Validate dimensions before allocating the full matrix grid.
 void validate_grid_parameters(
     int N, float Kt, float Kn, float w0x, float w0y, float zetax, float zetay,
     float m_tx, float m_ty, float aD, int up_or_down, int stx, int sty,
@@ -32,7 +32,7 @@ void validate_grid_parameters(
     check_matrix_index_capacity(batch_size, m);
 }
 
-// Return A0 and its inverse as two row-major 4 x 4 matrices.
+// A0 and invA0 are two row-major 4x4 system matrices.
 at::Tensor make_system_matrices(float w0x, float w0y, float zetax, float zetay,
                                 float m_tx, float m_ty, const at::Device& device) {
     auto host = at::zeros({2, 16}, at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
@@ -49,7 +49,7 @@ at::Tensor make_system_matrices(float w0x, float w0y, float zetax, float zetay,
 
     float* invA0 = A0 + 16;
 
-    // Gauss-Jordan elimination on [A0 | I], with partial pivoting.
+    // Gauss-Jordan elimination on [A0 | I] with partial pivoting.
     float augmented[32];
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 4; j++) {
@@ -98,27 +98,27 @@ at::Tensor make_system_matrices(float w0x, float w0y, float zetax, float zetay,
         }
     }
 
-    // The blocking copy keeps host storage alive until the transfer completes.
+    // The blocking copy keeps the temporary host buffer alive through transfer.
     return host.to(device);
 }
 
 }
 
-at::Tensor grid_matrices(
+static at::Tensor grid_matrices_impl(
     int N, float Kt, float Kn, float w0x, float w0y, float zetax, float zetay,
     float m_tx, float m_ty, float aD, int up_or_down, int stx, int sty,
-    float w_st, float w_fi, float o_st, float o_fi, int m, int device_id) {
+    float w_st, float w_fi, float o_st, float o_fi, int m, int device_id,
+    bool reduce) {
     validate_grid_parameters(N, Kt, Kn, w0x, w0y, zetax, zetay, m_tx, m_ty,
                             aD, up_or_down, stx, sty, w_st, w_fi, o_st, o_fi, m, device_id);
 
-    // Restore the caller's active CUDA device when this scope exits.
     const c10::cuda::CUDAGuard device_guard(at::Device(at::kCUDA, device_id));
     const int order = 2 * m + 4;
     auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, device_id);
-    auto result = at::empty({stx + 1, sty + 1, order, order}, options);
 
-    auto system = make_system_matrices(w0x, w0y, zetax, zetay, m_tx, m_ty, result.device());
-    auto coefficients = at::empty({4, m + 1}, result.options());
+    auto system = make_system_matrices(w0x, w0y, zetax, zetay, m_tx, m_ty,
+                                       at::Device(at::kCUDA, device_id));
+    auto coefficients = at::empty({4, m + 1}, options);
     float* A0 = system.data_ptr<float>();
     float* invA0 = A0 + 16;
     float* hxx = coefficients.data_ptr<float>();
@@ -126,7 +126,7 @@ at::Tensor grid_matrices(
     float* hyx = hxy + m + 1;
     float* hyy = hyx + m + 1;
 
-    // Use the current PyTorch stream so input and output operations stay ordered.
+    // Construct on the caller's current PyTorch stream.
     const auto stream = at::cuda::getCurrentCUDAStream(device_id).stream();
 
     float fist, fiex;
@@ -139,16 +139,58 @@ at::Tensor grid_matrices(
     }
     const float dtr = 2.0f * M_PI / N / m;
 
-    compute_cutting_coefficients_kernel<<<1, 256, 0, stream>>>(
+    constexpr int coefficient_threads = 256;
+    const int coefficient_blocks = (m + coefficient_threads) / coefficient_threads;
+    compute_cutting_coefficients_kernel<<<coefficient_blocks, coefficient_threads, 0, stream>>>(
         hxx, hxy, hyx, hyy, fist, fiex, Kt, Kn, N, m, dtr);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    // For m >= 2 the current-state and delay columns are disjoint.
-    if (m >= 2) {
+    at::Tensor active_map;
+    at::Tensor active_flags;
+    int output_order = order;
+    const bool global_path = m > 62;
+    if (reduce && m >= 2) {
+        active_map = at::empty({order + 1}, options.dtype(at::kInt));
+        if (global_path) {
+            active_flags = at::empty({order}, options.dtype(at::kInt));
+            launch_global_active_columns(active_map.data_ptr<int>(), active_flags.data_ptr<int>(),
+                hxx, hxy, hyx, hyy, m, stream);
+        } else {
+            launch_active_columns(active_map.data_ptr<int>(), hxx, hxy, hyx, hyy, m, stream);
+        }
+        output_order = active_map[0].item<int>();
+        TORCH_CHECK(output_order >= 4 && output_order <= order,
+                    "invalid active column count");
+    }
+    auto result = at::empty({stx + 1, sty + 1, output_order, output_order}, options);
+
+    if (global_path) {
+        const int64_t points = int64_t(stx + 1) * (sty + 1);
+        TORCH_CHECK(points <= std::numeric_limits<int>::max(),
+                    "global matrix constructor batch is too large");
         auto phi = at::empty({stx + 1, 64}, result.options());
-        launch_column_grid(result.data_ptr<float>(), phi.data_ptr<float>(),
+        const int64_t steps_elements = points * int64_t(m) * 36;
+        TORCH_CHECK(steps_elements <= std::numeric_limits<int64_t>::max(),
+                    "global step workspace size overflow");
+        auto steps = at::empty({steps_elements}, result.options());
+        launch_global_column_grid(result.data_ptr<float>(), phi.data_ptr<float>(), steps.data_ptr<float>(),
             A0, invA0, hxx, hxy, hyx, hyy,
-            stx, sty, o_st, o_fi, w_st, w_fi, N, m, stream);
+            stx, sty, o_st, o_fi, w_st, w_fi, N, m,
+            active_map.defined() ? active_map.data_ptr<int>() : nullptr,
+            output_order, stream);
+    } else if (m >= 2) {
+        auto phi = at::empty({stx + 1, 64}, result.options());
+        if (reduce) {
+            launch_reduced_column_grid(result.data_ptr<float>(), phi.data_ptr<float>(),
+                A0, invA0, hxx, hxy, hyx, hyy,
+                stx, sty, o_st, o_fi, w_st, w_fi, N, m,
+                active_map.const_data_ptr<int>(), output_order, stream);
+        } else {
+            launch_column_grid(result.data_ptr<float>(), phi.data_ptr<float>(),
+                A0, invA0, hxx, hxy, hyx, hyy,
+                stx, sty, o_st, o_fi, w_st, w_fi, N, m, stream);
+        }
+    // At m=1, current and delayed columns overlap and must accumulate.
     } else {
         const size_t shared_memory_bytes = 4 * (m + 1) * sizeof(float);
         stability_analysis_kernel<<<stx + 1, sty + 1, shared_memory_bytes, stream>>>(
@@ -159,6 +201,23 @@ at::Tensor grid_matrices(
     return result;
 }
 
+at::Tensor grid_matrices(
+    int N, float Kt, float Kn, float w0x, float w0y, float zetax, float zetay,
+    float m_tx, float m_ty, float aD, int up_or_down, int stx, int sty,
+    float w_st, float w_fi, float o_st, float o_fi, int m, int device_id) {
+    return grid_matrices_impl(N, Kt, Kn, w0x, w0y, zetax, zetay, m_tx, m_ty,
+        aD, up_or_down, stx, sty, w_st, w_fi, o_st, o_fi, m, device_id, false);
+}
+
+at::Tensor grid_reduced_matrices(
+    int N, float Kt, float Kn, float w0x, float w0y, float zetax, float zetay,
+    float m_tx, float m_ty, float aD, int up_or_down, int stx, int sty,
+    float w_st, float w_fi, float o_st, float o_fi, int m, int device_id) {
+    return grid_matrices_impl(N, Kt, Kn, w0x, w0y, zetax, zetay, m_tx, m_ty,
+        aD, up_or_down, stx, sty, w_st, w_fi, o_st, o_fi, m, device_id, true);
+}
+
+// Rows are [Kt,Kn,w0x,w0y,zetax,zetay,m_tx,m_ty]; preserve their output order.
 at::Tensor parameter_matrices(
     at::Tensor parameters, int N, float aD, int up_or_down, int m,
     float w, float o, int device_id) {
@@ -172,7 +231,6 @@ at::Tensor parameter_matrices(
     check_matrix_index_capacity(batch_size, m);
     const c10::cuda::CUDAGuard device_guard(parameters.device());
 
-    // Each row is Kt, Kn, w0x, w0y, zetax, zetay, m_tx, m_ty.
     TORCH_CHECK(at::isfinite(parameters).all().item<bool>(),
                 "parameters must contain only finite values");
     TORCH_CHECK(parameters.slice(1, 2, 4).gt(0).all().item<bool>(),
@@ -182,16 +240,27 @@ at::Tensor parameter_matrices(
 
     const int order = 2 * m + 4;
     auto result = at::empty({batch_size, order, order}, parameters.options());
-    // CUDA does not allow an empty launch; preserve the empty output shape.
+    // Preserve empty output shape without launching a CUDA block.
     if (batch_size == 0) {
 
         return result;
     }
     constexpr int threads = 256;
     const int blocks = (batch_size + threads - 1) / threads;
-    // Use the current PyTorch stream so input and output operations stay ordered.
+    // Construct on the caller's current PyTorch stream.
     const auto stream = at::cuda::getCurrentCUDAStream(device_id).stream();
-    if (m >= 2) {
+    if (m > 62) {
+        const int64_t h_stride = int64_t(4) * (m + 1);
+        const int64_t workspace_elements = batch_size * (64 + h_stride + int64_t(36) * m);
+        TORCH_CHECK(workspace_elements <= std::numeric_limits<int64_t>::max(),
+                    "global parameter workspace size overflow");
+        auto workspace = at::empty({workspace_elements}, parameters.options());
+        TORCH_CHECK(batch_size <= std::numeric_limits<int>::max(),
+                    "parameter batch is too large for global constructor");
+        launch_global_parameter_matrices(
+            result.data_ptr<float>(), workspace.data_ptr<float>(), parameters.data_ptr<float>(),
+            N, aD, up_or_down, m, w, o, static_cast<int>(batch_size), stream);
+    } else if (m >= 2) {
         auto geometry = N <= kParameterGeometryMaxTeeth
             ? at::empty({m + 1, N, 4}, parameters.options()) : at::Tensor();
         launch_parameter_columns(
@@ -201,7 +270,6 @@ at::Tensor parameter_matrices(
             m, w, o, static_cast<int>(batch_size), stream);
     } else {
 
-        // At m = 1, current-state and delay columns overlap and must accumulate.
         multi_parameter_single_point_kernel<<<blocks, threads, 0, stream>>>(
             result.data_ptr<float>(), parameters.data_ptr<float>(), N, aD,
             up_or_down, m, w, o, static_cast<int>(batch_size));

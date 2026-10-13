@@ -12,9 +12,9 @@ EI = max(abs(eigenvalues(F)))
 
 ## 安装
 
-需要 NVIDIA GPU、可用的 NVIDIA 驱动、Python 3.10+、支持 C++17 的编译器，以及 CUDA Toolkit 12.8+。Toolkit 必须包含 `nvcc`、cuBLAS 和 cuSOLVER；仅安装 PyTorch 的 CUDA 运行库不足以编译扩展。
+需要 NVIDIA GPU、可用的 NVIDIA 驱动、Python 3.10+、支持 C++17 的编译器，以及与 PyTorch 版本匹配的 CUDA Toolkit（包含 `nvcc`）。仅安装 PyTorch 的 CUDA 运行库不足以编译扩展。
 
-已验证的组合为 Linux、Python 3.10、PyTorch 2.8.0（CUDA 12.8）、CUDA Toolkit 12.8 和 RTX 3090。以下命令使用该 PyTorch/CUDA 组合，其他组合需要自行验证。
+以下安装示例使用 Linux、Python 3.10、PyTorch 2.8.0（CUDA 12.8）和 CUDA Toolkit 12.8。
 
 ```bash
 git clone https://github.com/kiwmn/millstability.git
@@ -42,14 +42,14 @@ python examples/basic_usage.py
 
 [examples/basic_usage.py](examples/basic_usage.py) 绘制 2010 年论文表 2 的两个逆铣案例：`a/D=0.1` 和 `0.05`，`m=40`，转速与切深分别划分为 400、200 个区间。程序计算 `EI=1` 等值线，保存为 `examples/two_dof_stability.png`，并打印每个案例的计算耗时。
 
-每个案例包含 80,601 个工艺点。单张 RTX 3090、Intel Xeon Platinum 8373C、PyTorch 2.8.0+cu128 下，按示例顺序各运行一次的实测结果：
+每个案例包含 80,601 个工艺点。下面是在 RTX 3090、Intel Xeon Platinum 8373C 和 PyTorch 2.8.0+cu128 下的完整 EI 计算耗时；本机自动使用 72 个 CPU 工作线程。
 
-| 案例 | 计算耗时（秒） |
-| --- | ---: |
-| `a/D=0.1` | 177.70 |
-| `a/D=0.05` | 167.96 |
+| 案例 | 示例单次运行（秒） | 预热后中位数（毫秒） |
+| --- | ---: | ---: |
+| `a/D=0.1` | 0.99 | 210.5 |
+| `a/D=0.05` | 0.19 | 164.1 |
 
-计时在调用前后同步 CUDA，包含矩阵构造、特征值求解和 EI 计算，不包含绘图与图片保存。
+单次耗时按示例顺序运行，首个案例包含初始化。中位数采用 4 次预热、8 次正式运行。调用前后同步 CUDA，计时包含矩阵构造、降阶、特征值求解和 EI 计算，不包含绘图。
 
 ![两个 2DOF 案例的稳定性边界](examples/two_dof_stability.png)
 
@@ -92,7 +92,7 @@ unstable = ei > 1.0
 | `stx`, `sty` | 转速、切深区间的划分数 | 正整数；`sty + 1` 不超过 GPU 每块最大线程数 |
 | `w_st`, `w_fi` | 轴向切深起止值，m | 非负有限数值 |
 | `o_st`, `o_fi` | 主轴转速起止值，rpm | 正有限数值 |
-| `m` | 一个刀齿通过周期内的时间离散步数 | 整数，`1 <= m <= 40` |
+| `m` | 一个刀齿通过周期内的时间离散步数 | 整数，`1 <= m <= 23168`；还受矩阵索引和显存容量限制 |
 | `device_id` | CUDA 设备编号 | 默认 `0` |
 
 ### 固定工艺点，多组物理参数
@@ -120,15 +120,12 @@ print(ei.shape)       # torch.Size([1])
 
 ## 实现与限制
 
-- 计算采用 `float32` 和 CUDA fast math；矩阵指数使用最高十阶 Taylor 展开。离散步数和输入参数会影响精度，不能仅凭接近 `1` 的 EI 判断稳定性。
-- 仅支持 CUDA 前向计算，不提供 CPU 后备实现和自动求导。
-- 矩阵构造及 EI 归约在 GPU 上执行，特征值由 [cuSOLVER Xgeev](https://docs.nvidia.com/cuda/archive/12.8.2/cusolver/index.html#cusolverdnxgeev) 求解。该求解器使用 CPU/GPU 协同计算和主机工作区，接口也包含同步错误检查。
-- 每点的内部矩阵阶数为 `2*m + 4`，矩阵存储约需 `点数 × (2*m + 4)² × 4` 字节。固定网格仅矩阵就约需 546 MiB，另需中间数据和求解器工作区。大网格或参数批次应按显存容量拆分调用。
-- 非法形状、类型、设备、非有限输入或求解失败会抛出异常。核函数采用 32 位矩阵索引，过大的批次会被拒绝。
-
-## 目录
-
-`src/` 包含 Python 绑定、矩阵构造和 EI 求解；`include/millstability/` 包含头文件；`examples/basic_usage.py` 绘制论文的两个 2DOF 案例。根目录的 `setup.py`、`pyproject.toml` 和 `MANIFEST.in` 分别负责 CUDA 编译、构建依赖和源码打包。
+- 矩阵在 CUDA 上以 `float32` 构造，使用 fast math 和最高十阶 Taylor 矩阵指数。降阶后转换为 `float64`，通过 PyTorch `torch.linalg.eigvals` 求全部特征值并取最大模。
+- 降阶只删除严格零列及对应行，保留所有非零特征值，不使用截断阈值。网格直接构造相应主子矩阵；多参数接口先构造完整矩阵，再逐矩阵降阶。`m=1` 使用处理当前状态与延迟状态重叠的矩阵递推。
+- 特征值批次并行计算。工作线程数由可用物理核、CPU 亲和性、CPU 配额、矩阵数量和可用显存自动选择。输入与输出为 CUDA 张量，特征值求解后端由 PyTorch 决定；调用方的全局线程设置保持不变。
+- 仅支持 CUDA 前向计算，不提供 CPU 输入接口和自动求导。最终 EI 为 CUDA `float32`；若大于 1 的 FP64 结果舍入后会变成 1，则写为大于 1 的最小 FP32 值，以保留计算所得的稳定性分类。
+- 完整矩阵阶数为 `2*m+4`。例如 `N=2, aD=0.05, m=40` 的网格由 84 阶降至 16 阶，矩阵存储约为 `点数 × 降阶后阶数² × 4` 字节；`(201,101)` 网格约需 19.8 MiB，另需中间数据和求解工作区。大批次应按显存容量拆分。
+- 离散步数与浮点误差会影响稳定性边界。非法形状、类型、设备、非有限输入、超出矩阵索引容量或求解失败会抛出异常。
 
 ## 参考文献
 

@@ -7,8 +7,7 @@ using namespace millstability;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
 
-    // Release the GIL while the C++/CUDA call runs.
-    module.doc() = "Milling stability: CUDA matrices, cuSOLVER eigenvalues and CUDA EI reduction";
+    module.doc() = "Milling stability: reduced CUDA matrices and PyTorch FP64 eigenvalues";
     module.def("milling_stability_ei_cuda", &milling_stability_ei_cuda,
         "Return EI [spindle speed, cutting depth] on CUDA",
         py::arg("N"), py::arg("Kt"), py::arg("Kn"), py::arg("w0x"), py::arg("w0y"),

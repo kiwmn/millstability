@@ -7,17 +7,17 @@ namespace millstability::detail {
 namespace {
 
 struct ParameterColumnConfig {
-    static constexpr int kColumnThreads = 96;
-    static constexpr int kMaxSteps = 40;
-    static constexpr int kMaxOrder = 84;
-    // 32 coefficients plus padding keep each step aligned for float4 loads.
+    static constexpr int kColumnThreads = 128;
+    static constexpr int kMaxSteps = 62;
+    static constexpr int kMaxOrder = 128;
+    // 32 update coefficients and four padding floats keep float4 reads aligned.
     static constexpr int kStepStride = 36;
     static_assert(kColumnThreads >= kMaxOrder);
     static_assert(kColumnThreads >= kMaxSteps + 1);
     static_assert(kColumnThreads % 32 == 0);
 };
 
-// Thread 0 prepares the four integration matrices for one parameter row.
+// Thread 0 writes four row-major 4x4 integration matrices for its parameter group.
 __device__ __forceinline__ void prepare_parameter_phi(
     float* phi, const float* parameters, int N, int m, float o) {
 
@@ -56,6 +56,8 @@ __device__ __forceinline__ void prepare_parameter_phi(
 
     float s_Fi1[16] = {0}, s_Fi2[16] = {0}, s_Fi3[16] = {0};
 
+    // Phi1=A0^-1*(Phi0-I), Phi2=A0^-1*(Phi0*dt-Phi1),
+    // Phi3=A0^-1*(Phi0*dt^2-2*Phi2).
     float Fi0_minus_I[16];
     for (int i = 0; i < 16; i++) {
         Fi0_minus_I[i] = s_Fi0[i] - (i % 5 == 0 ? 1.0f : 0.0f);
@@ -108,7 +110,8 @@ __device__ __forceinline__ void prepare_parameter_phi(
     }
 }
 
-// Tooth angles and engagement are shared by all parameter rows.
+// For sample i and tooth j (1..N), geometry[i*N+j-1] stores
+// (cos(phi), sin(phi), engaged, 0), shared across parameter groups.
 __global__ void prepare_parameter_geometry_kernel(
     float4* geometry, int N, float aD, int up_or_down, int runtime_m) {
     const int i = threadIdx.x;
@@ -135,7 +138,7 @@ __global__ void prepare_parameter_geometry_kernel(
     }
 }
 
-// Pack each active row as four current-state coefficients and four delay coefficients.
+// Pack each update row as four current-state and four delay coefficients.
 __device__ __forceinline__ void prepare_parameter_step_coefficients(
     float* packed_D, const float* phi,
     const float* d_hxx_shared, const float* d_hxy_shared,
@@ -149,7 +152,6 @@ __device__ __forceinline__ void prepare_parameter_step_coefficients(
     const float* s_Fi3 = phi + 48;
     float D[4][8];
 
-    // A0k holds the next sample of cutting coefficients, multiplied by -depth.
     float A0k[16] = {0};
     if (i < m) {
         A0k[2*4 + 0] = -w * d_hxx_shared[i + 1];
@@ -158,7 +160,6 @@ __device__ __forceinline__ void prepare_parameter_step_coefficients(
         A0k[3*4 + 1] = -w * d_hyy_shared[i + 1];
     }
 
-    // A1k is depth times the coefficient difference divided by dt.
     float A1k[16] = {0};
     if (i < m) {
         A1k[2*4 + 0] = w * (d_hxx_shared[i + 1] - d_hxx_shared[i]) / dt;
@@ -167,7 +168,7 @@ __device__ __forceinline__ void prepare_parameter_step_coefficients(
         A1k[3*4 + 1] = w * (d_hyy_shared[i + 1] - d_hyy_shared[i]) / dt;
     }
 
-    // F01 = (Fi2*A0k + Fi3*A1k) / dt.
+    // F01=(Phi2*A0k+Phi3*A1k)/dt (Ding et al., 2010, Eq. 11).
     float F01[16] = {0};
 
     float temp1[16] = {0};
@@ -194,7 +195,7 @@ __device__ __forceinline__ void prepare_parameter_step_coefficients(
         F01[idx] = temp1[idx] + temp2[idx];
     }
 
-    // Fkp1 = (Fi1 - Fi2/dt)*A0k + (Fi2 - Fi3/dt)*A1k.
+    // Fkp1=(Phi1-Phi2/dt)*A0k+(Phi2-Phi3/dt)*A1k (Eq. 12).
     float Fkp1[16] = {0};
 
     float temp3[16] = {0};
@@ -234,7 +235,6 @@ __device__ __forceinline__ void prepare_parameter_step_coefficients(
         }
     }
 
-    // The step update uses inverse(I - Fkp1).
     float invOfImFkp1[16];
     inverse_register_4x4(I_minus_Fkp1, invOfImFkp1);
 
@@ -290,8 +290,7 @@ __device__ __forceinline__ void prepare_parameter_step_coefficients(
     }
 }
 
-// One block owns a parameter row; one thread propagates each matrix column.
-// The launch bounds constrain register use for the 96-thread block.
+// For 2<=m<=62, one block owns a parameter group and one thread propagates each column.
 template <int StaticSteps, bool PreparedGeometry>
 
 __global__ __launch_bounds__(ParameterColumnConfig::kColumnThreads, 10)
@@ -306,11 +305,11 @@ void parameter_fused_column_kernel(
     __shared__ float cutting[4][ParameterColumnConfig::kMaxSteps + 1];
     __shared__ __align__(16) float steps[ParameterColumnConfig::kMaxSteps][ParameterColumnConfig::kStepStride];
 
+    // Thread 0 prepares integration matrices while other threads compute cutting samples.
     if (col == 0) {
         prepare_parameter_phi(phi, parameters + point * 8, N, runtime_m, o);
     }
 
-    // The first m + 1 threads sum tooth contributions independently for each sample.
     if (col <= m) {
         const int i = col;
         const float Kt = parameters[point * 8];
@@ -382,11 +381,9 @@ void parameter_fused_column_kernel(
     const float* coefficients = steps[0];
     int last_basis = order - 2;
 
-    // Keep the time recurrence as a loop to limit generated instruction size.
     #pragma unroll 1
     for (int i = 0; i < m; ++i) {
         const int previous_basis = i == m - 1 ? 0 : last_basis - 2;
-        // Write each pair of displacement history rows directly to its final position.
         history_output[0] = current[0];
         history_output[order] = current[1];
         float next[4];
@@ -424,6 +421,7 @@ void launch_parameter_columns(
     float* result, float* geometry_workspace,
     const float* parameters, int N, float aD, int up_or_down,
     int m, float w, float o, int n_params, cudaStream_t stream) {
+    // N<=64 uses geometry shared by all physical parameter groups.
     if (N <= kParameterGeometryMaxTeeth) {
         prepare_parameter_geometry_kernel<<<1, 64, 0, stream>>>(
             reinterpret_cast<float4*>(geometry_workspace), N, aD, up_or_down, m);

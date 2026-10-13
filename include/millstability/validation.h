@@ -19,6 +19,7 @@ inline void check_cuda_float_tensor(const at::Tensor& tensor,
     TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
     TORCH_CHECK(tensor.scalar_type() == at::kFloat, name, " must have dtype float32");
     TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+    TORCH_CHECK(!tensor.requires_grad(), name, " does not support autograd");
     TORCH_CHECK(tensor.get_device() == device_id,
                 name, " must be on CUDA device ", device_id);
 }
@@ -27,11 +28,11 @@ inline void check_finite(float value, const char* name) {
     TORCH_CHECK(std::isfinite(value), name, " must be finite");
 }
 
-// The fixed-size device arrays support at most 40 time steps.
+// m time steps give matrix order 2*m+4; the maximum supported order is 46340.
 inline void check_discretization(int N, float aD, int up_or_down, int m) {
     TORCH_CHECK(N > 0 && N < std::numeric_limits<int>::max(), "N must be positive");
-    TORCH_CHECK(m >= 1 && m <= 40,
-                "m must be in [1, 40] for the fixed-size matrix workspace");
+    TORCH_CHECK(m >= 1 && m <= 23168,
+                "m must be in [1, 23168] (matrix order <= 46340)");
     TORCH_CHECK(std::isfinite(aD) && aD >= 0.0f && aD <= 1.0f,
                 "aD must be finite and in [0, 1]");
     TORCH_CHECK(up_or_down == 1 || up_or_down == -1,
@@ -60,10 +61,15 @@ inline void check_physical_parameters(float Kt, float Kn, float w0x, float w0y,
                 "masses must be finite and positive");
 }
 
-// Matrix offsets use 32-bit integers inside the CUDA kernels.
+// CUDA matrix offsets use 32-bit indices; check the complete batch before allocation.
 inline void check_matrix_index_capacity(int64_t batch_size, int m) {
-    const int64_t order = 2 * m + 4;
-    TORCH_CHECK(batch_size <= std::numeric_limits<int>::max() / (order * order),
+    const int64_t order = 2 * int64_t(m) + 4;
+    TORCH_CHECK(order > 0 && order <= std::numeric_limits<int64_t>::max() / order,
+                "matrix order square overflows 64-bit indexing");
+    const int64_t matrix_elements = order * order;
+    TORCH_CHECK(batch_size <= std::numeric_limits<int64_t>::max() / matrix_elements,
+                "matrix batch allocation overflows 64-bit indexing");
+    TORCH_CHECK(batch_size <= std::numeric_limits<int>::max() / matrix_elements,
                 "matrix batch is too large for the 32-bit kernel indices");
 }
 
